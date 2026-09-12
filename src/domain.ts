@@ -169,6 +169,21 @@ export type GeneratePlan = {
   duplicates: string[];
 };
 
+/** 一次生成动作的条件快照：重复告警只对该日期+班次+区域组合有效 */
+export type GenerateScope = {
+  date: string;
+  shift: Shift;
+  areas: string[];
+};
+
+/** 条件是否相同（区域集合相同即可，与勾选顺序无关）；条件一变旧告警立即失效 */
+export function sameScope(a: GenerateScope, b: GenerateScope): boolean {
+  if (a.date !== b.date || a.shift !== b.shift) return false;
+  if (a.areas.length !== b.areas.length) return false;
+  const setB = new Set(b.areas);
+  return a.areas.every((area) => setB.has(area));
+}
+
 /**
  * 按区域一次生成某天某班次的巡检项；
  * 同设备同班次已存在则拦截（跳过并列出），不做覆盖。

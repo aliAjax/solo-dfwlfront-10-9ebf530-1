@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { DatePicker, Form, Input, Modal } from "antd";
 import dayjs from "dayjs";
 import { InspectionStatus, STATUS_LABEL, StatusChangeInput } from "../domain";
@@ -37,10 +37,12 @@ export default function StatusModal({
 }: Props) {
   const changeStatus = useInspectionStore((s) => s.changeStatus);
   const [form] = Form.useForm<FormValues>();
+  const [saving, setSaving] = useState(false);
   const isAbnormal = target === "abnormal";
 
   useEffect(() => {
     if (open) {
+      setSaving(false);
       form.setFieldsValue({
         operator,
         reason: "",
@@ -61,7 +63,7 @@ export default function StatusModal({
   function handleOk() {
     form
       .validateFields()
-      .then((values) => {
+      .then(async (values) => {
         if (!recordId) return;
         const input: StatusChangeInput = {
           operator: values.operator,
@@ -74,13 +76,19 @@ export default function StatusModal({
               }
             : {}),
         };
-        const result = changeStatus(recordId, target, input);
-        if (!result.ok) {
-          form.setFields([{ name: "reason", errors: [result.message] }]);
-          return;
+        setSaving(true);
+        try {
+          // 判定与写入均以 store 锁内重读的最新数据为准
+          const result = await changeStatus(recordId, target, input);
+          if (!result.ok) {
+            form.setFields([{ name: "reason", errors: [result.message] }]);
+            return;
+          }
+          onSucceeded();
+          onClose();
+        } finally {
+          setSaving(false);
         }
-        onSucceeded();
-        onClose();
       })
       .catch(() => {
         // 校验失败时 antd 已在字段下提示，信息不全不能提交
@@ -96,6 +104,7 @@ export default function StatusModal({
       onOk={handleOk}
       onCancel={onClose}
       destroyOnHidden
+      confirmLoading={saving}
       okButtonProps={{ danger: isAbnormal }}
     >
       <Form form={form} layout="vertical" className="status-form">

@@ -14,6 +14,7 @@ import {
   migrateLegacy,
   nextStatuses,
   planGenerate,
+  sameScope,
   validateChange,
 } from "../src/domain";
 
@@ -81,6 +82,18 @@ check("同班次不同日期不算重复", () => {
   const existing = [makeRecord({ date: "2026-09-11" })];
   const plan = planGenerate(existing, now, "morning", ["加油区"]);
   assert.ok(plan.creates.some((c) => c.device === "加油机1号"));
+});
+
+console.log("2b) 重复告警作用域");
+check("日期/班次/区域任一变化 → sameScope 为 false（旧告警必须立即失效）", () => {
+  const base = { date: now, shift: "morning" as const, areas: ["加油区", "油罐区"] };
+  assert.strictEqual(sameScope(base, { ...base }), true);
+  // 区域勾选顺序不同但集合相同 → 视为同一作用域，告警仍有效
+  assert.strictEqual(sameScope(base, { ...base, areas: ["油罐区", "加油区"] }), true);
+  assert.strictEqual(sameScope(base, { ...base, date: "2026-09-13" }), false);
+  assert.strictEqual(sameScope(base, { ...base, shift: "night" }), false);
+  assert.strictEqual(sameScope(base, { ...base, areas: ["加油区"] }), false);
+  assert.strictEqual(sameScope(base, { ...base, areas: ["加油区", "油罐区", "收银区"] }), false);
 });
 
 console.log("3) 状态机");

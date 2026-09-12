@@ -81,8 +81,8 @@ export default function App() {
     setModal({ open: true, record, target });
   }
 
-  function handleRemove(id: string) {
-    remove(id);
+  async function handleRemove(id: string) {
+    await remove(id);
     message.success("记录已删除");
   }
 

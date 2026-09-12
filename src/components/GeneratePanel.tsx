@@ -1,7 +1,4 @@
-import {
-  useMemo,
-  useState,
-} from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   Alert,
   Button,
@@ -19,10 +16,12 @@ import dayjs from "dayjs";
 import {
   AREAS,
   AREA_CATALOG,
+  GenerateScope,
   SHIFT_LABEL,
   SHIFT_TIME,
   Shift,
   planGenerate,
+  sameScope,
   today,
 } from "../domain";
 import { useInspectionStore } from "../store";
@@ -35,50 +34,74 @@ type GenForm = {
   areas: string[];
 };
 
-/** 按区域一次生成当天（某日某班次）巡检项；重复设备提示并拦截 */
+function scopeOf(values: GenForm): GenerateScope {
+  return {
+    date: values.date.format("YYYY-MM-DD"),
+    shift: values.shift,
+    areas: [...values.areas],
+  };
+}
+
+/** 按区域一次生成当天（某日某班次）巡检项；重复设备整单拦截并提示 */
 export default function GeneratePanel() {
   const records = useInspectionStore((s) => s.records);
   const generate = useInspectionStore((s) => s.generate);
   const [form] = Form.useForm<GenForm>();
-  const [duplicates, setDuplicates] = useState<string[]>([]);
+  const [submitting, setSubmitting] = useState(false);
+  // 重复告警及其触发条件快照；只对该日期+班次+区域组合有效
+  const [dupAlert, setDupAlert] = useState<{ scope: GenerateScope; items: string[] } | null>(null);
 
   const date = Form.useWatch("date", form) ?? dayjs();
   const shift = Form.useWatch("shift", form) ?? "morning";
   const selectedAreas = Form.useWatch("areas", form) ?? AREAS;
+  const liveScope: GenerateScope = {
+    date: date.format("YYYY-MM-DD"),
+    shift,
+    areas: selectedAreas,
+  };
 
   const preview = useMemo(
-    () => planGenerate(records, date.format("YYYY-MM-DD"), shift, selectedAreas),
-    [records, date, shift, selectedAreas]
+    () => planGenerate(records, liveScope.date, liveScope.shift, liveScope.areas),
+    [records, liveScope.date, liveScope.shift, liveScope.areas]
   );
 
-  function run() {
-    form
-      .validateFields()
-      .then((values) => {
-        const outcome = generate(
-          values.date.format("YYYY-MM-DD"),
-          values.shift,
-          values.areas
-        );
-        if (!outcome.ok) {
-          setDuplicates(outcome.duplicates);
-          message.warning(outcome.message);
-          return;
-        }
-        setDuplicates(outcome.duplicates);
-        const dupTip =
-          outcome.duplicates.length > 0
-            ? `，已自动跳过 ${outcome.duplicates.length} 个重复项`
-            : "";
-        message.success(
-          `已生成 ${outcome.created} 项巡检（${values.date.format(
-            "YYYY-MM-DD"
-          )} ${SHIFT_LABEL[values.shift]}）${dupTip}`
-        );
-      })
-      .catch(() => {
-        message.warning("请先选择巡检日期、班次和至少一个区域。");
-      });
+  // 表单条件变化 → 旧告警立即失效（不依赖下次点击）
+  useEffect(() => {
+    if (dupAlert && !sameScope(dupAlert.scope, liveScope)) {
+      setDupAlert(null);
+    }
+  }, [liveScope, dupAlert]);
+
+  async function run() {
+    let values: GenForm;
+    try {
+      values = await form.validateFields();
+    } catch {
+      message.warning("请先选择巡检日期、班次和至少一个区域。");
+      return;
+    }
+    setSubmitting(true);
+    try {
+      // 判定以点击时存储中的最新数据为准（store 内加锁后重读），不使用面板预览的旧列表
+      const outcome = await generate(
+        values.date.format("YYYY-MM-DD"),
+        values.shift,
+        values.areas
+      );
+      const scope = scopeOf(values);
+      if (!outcome.ok) {
+        // 重复提示与拦截同源：只对本次触发条件生效
+        setDupAlert({ scope, items: outcome.duplicates });
+        message.warning(outcome.message);
+        return;
+      }
+      setDupAlert(null);
+      message.success(
+        `已生成 ${outcome.created} 项巡检（${scope.date} ${SHIFT_LABEL[scope.shift]}）。`
+      );
+    } finally {
+      setSubmitting(false);
+    }
   }
 
   return (
@@ -143,28 +166,32 @@ export default function GeneratePanel() {
         <div className="gen-summary">
           <Space size={[8, 8]} wrap>
             <Tag>待生成 {preview.creates.length}</Tag>
-            <Tag color="orange">重复跳过 {preview.duplicates.length}</Tag>
+            <Tag color="orange">已存在 {preview.duplicates.length}</Tag>
           </Space>
           <Text type="secondary" className="gen-hint">
-            同一设备在同一班次重复生成会被自动拦截。
+            同一设备在同一班次已存在时，本次生成将整单拦截、不写入任何记录。
           </Text>
         </div>
 
-        {duplicates.length > 0 && (
+        {dupAlert && sameScope(dupAlert.scope, liveScope) && (
           <Alert
             className="dup-alert"
             type="warning"
             showIcon
-            message={`以下设备在 ${date.format("YYYY-MM-DD")} ${
-              SHIFT_LABEL[shift]
-            } 已存在，未重复生成：`}
-            description={duplicates.map((d) => (
-              <div key={d}>· {d}</div>
-            ))}
+            message={`${dupAlert.scope.date} ${
+              SHIFT_LABEL[dupAlert.scope.shift]
+            } 以下设备已存在，本次未写入任何记录：`}
+            description={
+              dupAlert.items.length > 0 ? (
+                dupAlert.items.map((d) => <div key={d}>· {d}</div>)
+              ) : (
+                <div>其他标签正在写入或所选范围无待生成项，请刷新后重试。</div>
+              )
+            }
           />
         )}
 
-        <Button type="primary" block size="large" onClick={run}>
+        <Button type="primary" block size="large" loading={submitting} onClick={run}>
           生成巡检项
         </Button>
       </Form>
