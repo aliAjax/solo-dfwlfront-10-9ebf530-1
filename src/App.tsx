@@ -82,8 +82,27 @@ export default function App() {
   }
 
   async function handleRemove(id: string) {
-    await remove(id);
-    message.success("记录已删除");
+    const result = await remove(id);
+    if (result.ok) {
+      message.success("记录已删除");
+    } else {
+      // 拿不到锁 / 落盘失败 / 已被其他标签删除：明确提示失败，列表已按存储刷新，可直接重试
+      message.error(result.message);
+    }
+  }
+
+  function saveOperator(name: string) {
+    const result = setOperator(name);
+    if (!result.ok) message.warning(result.message);
+  }
+
+  async function handleResetAll() {
+    const result = await resetAll();
+    if (result.ok) {
+      message.success("已恢复演示数据（旧格式）");
+    } else {
+      message.error(result.message);
+    }
   }
 
   const metricCards = [
@@ -122,8 +141,8 @@ export default function App() {
                   value={operatorDraft}
                   maxLength={20}
                   onChange={(e) => setOperatorDraft(e.target.value)}
-                  onBlur={() => setOperator(operatorDraft)}
-                  onPressEnter={() => setOperator(operatorDraft)}
+                  onBlur={() => saveOperator(operatorDraft)}
+                  onPressEnter={() => saveOperator(operatorDraft)}
                   style={{ width: 180 }}
                 />
               </Space.Compact>
@@ -132,10 +151,7 @@ export default function App() {
                   description="当前所有巡检记录将被清空并重新写入旧格式示例数据。"
                   okText="恢复"
                   cancelText="取消"
-                  onConfirm={() => {
-                    resetAll();
-                    message.success("已恢复演示数据（旧格式）");
-                  }}
+                  onConfirm={handleResetAll}
                 >
                   <Button>重置演示数据</Button>
                 </Popconfirm>

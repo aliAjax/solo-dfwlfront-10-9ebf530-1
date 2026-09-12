@@ -189,29 +189,41 @@ async function acquireLock(): Promise<boolean> {
 }
 
 /**
- * 跨标签串行化的写事务：
- * 加锁 → 从 localStorage 重读最新数据 → 计算变更 → 单次 setItem 原子写入 → 释放锁。
+ * 跨标签串行化的写事务。绝不抛出异常，统一返回三种事务结果：
+ * - ok：拿到锁、计算完成；fn 返回 next 时已原子落盘，next 为 null 表示业务层拦截、未写入
+ * - lock：等待后仍拿不到锁（其他标签正在写），未做任何读取外的修改
+ * - persist：拿到锁并算出结果，但 setItem 失败（配额/存储不可用），存储保持原值
+ * 三种情况下原有数据都可通过 readLatest() 正常读取。
  */
+type TxResult<T> =
+  | { tx: "ok"; result: T }
+  | { tx: "lock" }
+  | { tx: "persist" };
+
 async function withLock<T>(
-  fn: (latest: InspectionRecord[]) => { result: T; next: InspectionRecord[] | null },
-  lockedResult: T
-): Promise<T> {
+  fn: (latest: InspectionRecord[]) => { result: T; next: InspectionRecord[] | null }
+): Promise<TxResult<T>> {
   const locked = await acquireLock();
   if (!locked) {
-    // 拿锁失败（其他标签正在写）：不做任何写入，返回调用方指定的失败结果
-    return lockedResult;
+    return { tx: "lock" };
   }
   try {
     const latest = readLatest();
     const { result, next } = fn(latest);
+    // 仅业务层真正要写入时才落盘；单次 setItem 原子替换，失败则存储保持原值
     if (next !== null && !persist(next)) {
-      throw new Error("persist failed");
+      return { tx: "persist" };
     }
-    return result;
+    return { tx: "ok", result };
   } finally {
     releaseLock();
   }
 }
+
+/** 统一的失败文案：界面据此显示明确失败，且用户可原样重试 */
+const MSG_LOCK = "其他标签正在写入，本次未保存，请稍后重试。";
+const MSG_PERSIST = "浏览器存储写入失败（可能空间不足或被禁用），数据未改动，请重试。";
+const MSG_NOT_FOUND = "记录已不存在（可能已被其他标签删除），列表已刷新。";
 
 /* ---------------- 操作人 ---------------- */
 
@@ -232,12 +244,13 @@ export type GenerateOutcome =
 type InspectionState = {
   records: InspectionRecord[];
   operator: string;
-  setOperator: (name: string) => void;
+  setOperator: (name: string) => ChangeResult;
   /** 按区域生成；有任何重复即整单拦截、零写入 */
   generate: (date: string, shift: Shift, areas: string[]) => Promise<GenerateOutcome>;
   changeStatus: (recordId: string, next: StatusEvent["status"], input: StatusChangeInput) => Promise<ChangeResult>;
-  remove: (recordId: string) => Promise<void>;
-  resetAll: () => Promise<void>;
+  /** 条件删除：记录存在才删除；不存在/拿锁失败/落盘失败都返回失败，绝不假成功 */
+  remove: (recordId: string) => Promise<ChangeResult>;
+  resetAll: () => Promise<ChangeResult>;
   /** 其他标签写入后（storage 事件 / 窗口重新可见）从 localStorage 同步 */
   syncFromStorage: () => void;
 };
@@ -255,156 +268,144 @@ export const useInspectionStore = create<InspectionState>((set, get) => ({
 
   setOperator: (name) => {
     const trimmed = name.trim();
+    let saved = true;
     try {
       localStorage.setItem(OPERATOR_KEY, trimmed);
     } catch {
-      // ignore
+      saved = false;
     }
     set({ operator: trimmed });
+    // 操作人不影响巡检数据；存储不可用时本次会话仍可用，但要如实告知
+    return saved
+      ? { ok: true }
+      : { ok: false, message: "操作人仅在本次会话有效：浏览器存储不可用，刷新后不会保留。" };
   },
 
   generate: (date, shift, areas) => {
     const scope: GenerateScope = { date, shift, areas: [...areas] };
-    return withLock<GenerateOutcome>(
-      (latest) => {
-        // 判定一律以锁内重读的最新存储数据为准，绝不使用标签打开时的旧列表
-        const plan = planGenerate(latest, date, shift, areas);
+    return withLock<GenerateOutcome>((latest) => {
+      // 判定一律以锁内重读的最新存储数据为准，绝不使用标签打开时的旧列表
+      const plan = planGenerate(latest, date, shift, areas);
 
-        // 整单拦截：任何一个设备已存在 → 全部不写入，重复项与拦截判定同源
-        if (plan.duplicates.length > 0) {
-          return {
-            result: {
-              ok: false,
-              message: `所选区域有 ${plan.duplicates.length} 项已在该班次生成，本次未写入任何记录，请调整后重试。`,
-              duplicates: plan.duplicates,
-              scope,
-            },
-            next: null,
-          };
-        }
-        if (plan.creates.length === 0) {
-          return {
-            result: {
-              ok: false,
-              message: "没有可生成的巡检项（请至少选择一个区域）。",
-              duplicates: [],
-              scope,
-            },
-            next: null,
-          };
-        }
-
-        // 单次 setItem 写入整批记录：要么全写，要么不写
-        const created: InspectionRecord[] = plan.creates.map((c) => ({
-          id: uid(),
-          date: c.date,
-          shift: c.shift,
-          area: c.area,
-          device: c.device,
-          statusEvents: [],
-        }));
-
+      // 整单拦截：任何一个设备已存在 → 全部不写入，重复项与拦截判定同源
+      if (plan.duplicates.length > 0) {
         return {
-          result: { ok: true, created: created.length, scope },
-          next: [...created, ...latest],
+          result: {
+            ok: false,
+            message: `所选区域有 ${plan.duplicates.length} 项已在该班次生成，本次未写入任何记录，请调整后重试。`,
+            duplicates: plan.duplicates,
+            scope,
+          },
+          next: null,
         };
-      },
-      {
-        ok: false,
-        message: "其他标签正在写入，请稍后重试（本次未写入任何记录）。",
-        duplicates: [],
-        scope,
       }
-    ).then((outcome) => {
-      // 成功或被拦截，都以存储为准刷新内存，保证本标签马上看到最新结果
+      if (plan.creates.length === 0) {
+        return {
+          result: {
+            ok: false,
+            message: "没有可生成的巡检项（请至少选择一个区域）。",
+            duplicates: [],
+            scope,
+          },
+          next: null,
+        };
+      }
+
+      // 单次 setItem 写入整批记录：要么全写，要么不写
+      const created: InspectionRecord[] = plan.creates.map((c) => ({
+        id: uid(),
+        date: c.date,
+        shift: c.shift,
+        area: c.area,
+        device: c.device,
+        statusEvents: [],
+      }));
+
+      return {
+        result: { ok: true, created: created.length, scope },
+        next: [...created, ...latest],
+      };
+    }).then((tx) => {
+      // 任何结局都以存储为准刷新内存；失败时回到存储原值，不做乐观更新、不回退
       set({ records: readLatest() });
-      return outcome;
+      if (tx.tx === "ok") return tx.result;
+      if (tx.tx === "lock") {
+        return { ok: false, message: MSG_LOCK, duplicates: [], scope } satisfies GenerateOutcome;
+      }
+      return { ok: false, message: MSG_PERSIST, duplicates: [], scope } satisfies GenerateOutcome;
     });
   },
 
   changeStatus: (recordId, nextStatus, input) => {
-    return withLock<ChangeResult>(
-      (latest) => {
-        const record = latest.find((r) => r.id === recordId);
-        if (!record) return { result: { ok: false, message: "记录不存在（可能已被其他标签删除）。" }, next: null };
+    return withLock<ChangeResult>((latest) => {
+      const record = latest.find((r) => r.id === recordId);
+      if (!record) return { result: { ok: false, message: MSG_NOT_FOUND }, next: null };
 
-        const current = currentStatus(record);
-        if (!nextStatuses(current).includes(nextStatus)) {
-          return {
-            result: {
-              ok: false,
-              message:
-                current === "normal"
-                  ? "正常为关闭状态，不能再变更（不能回到未检）。"
-                  : "当前状态不允许该变更。",
-            },
-            next: null,
-          };
-        }
-
-        const check = validateChange(current, nextStatus, input);
-        if (!check.ok) return { result: check, next: null };
-
-        const event: StatusEvent = {
-          id: uid(),
-          status: nextStatus,
-          at: new Date().toISOString(),
-          operator: input.operator.trim(),
-          reason: input.reason.trim(),
-          ...(nextStatus === "abnormal"
-            ? {
-                foundAt: input.foundAt!.trim(),
-                handler: input.handler!.trim(),
-                rectification: input.rectification!.trim(),
-              }
-            : {}),
+      const current = currentStatus(record);
+      if (!nextStatuses(current).includes(nextStatus)) {
+        return {
+          result: {
+            ok: false,
+            message:
+              current === "normal"
+                ? "正常为关闭状态，不能再变更（不能回到未检）。"
+                : "当前状态不允许该变更。",
+          },
+          next: null,
         };
-
-        const updated = latest.map((r) =>
-          r.id === recordId ? { ...r, statusEvents: [...r.statusEvents, event] } : r
-        );
-        return { result: { ok: true }, next: updated };
-      },
-      { ok: false, message: "其他标签正在写入，请稍后重试。" }
-    ).then(
-      (result) => {
-        set({ records: readLatest() });
-        return result;
-      },
-      () => {
-        // 持久化失败：内存不做乐观更新，返回失败
-        set({ records: readLatest() });
-        return { ok: false, message: "保存失败（浏览器存储不可用），本次未写入，请重试。" } satisfies ChangeResult;
       }
-    );
+
+      const check = validateChange(current, nextStatus, input);
+      if (!check.ok) return { result: check, next: null };
+
+      const event: StatusEvent = {
+        id: uid(),
+        status: nextStatus,
+        at: new Date().toISOString(),
+        operator: input.operator.trim(),
+        reason: input.reason.trim(),
+        ...(nextStatus === "abnormal"
+          ? {
+              foundAt: input.foundAt!.trim(),
+              handler: input.handler!.trim(),
+              rectification: input.rectification!.trim(),
+            }
+          : {}),
+      };
+
+      const updated = latest.map((r) =>
+        r.id === recordId ? { ...r, statusEvents: [...r.statusEvents, event] } : r
+      );
+      return { result: { ok: true }, next: updated };
+    }).then((tx) => {
+      set({ records: readLatest() });
+      if (tx.tx === "ok") return tx.result;
+      return { ok: false, message: tx.tx === "lock" ? MSG_LOCK : MSG_PERSIST };
+    });
   },
 
   remove: (recordId) => {
-    return withLock<{ ok: true } | { ok: false; message: string }>(
-      (latest) => ({
-        result: { ok: true },
-        next: latest.filter((r) => r.id !== recordId),
-      }),
-      { ok: false, message: "其他标签正在写入，请稍后重试。" }
-    ).then(
-      () => {
-        set({ records: readLatest() });
-      },
-      () => {
-        set({ records: readLatest() });
+    return withLock<ChangeResult>((latest) => {
+      // 条件删除：目标必须仍存在，否则按失败处理（可能已被其他标签删除），不假成功
+      if (!latest.some((r) => r.id === recordId)) {
+        return { result: { ok: false, message: MSG_NOT_FOUND }, next: null };
       }
-    );
+      return { result: { ok: true }, next: latest.filter((r) => r.id !== recordId) };
+    }).then((tx) => {
+      set({ records: readLatest() });
+      if (tx.tx === "ok") return tx.result;
+      return { ok: false, message: tx.tx === "lock" ? MSG_LOCK : MSG_PERSIST };
+    });
   },
 
   resetAll: () => {
-    return withLock<{ ok: true }>(
-      () => ({
-        result: { ok: true },
-        next: migrateLegacy(LEGACY_SEED),
-      }),
-      { ok: true }
-    ).then(() => {
+    return withLock<ChangeResult>(() => ({
+      result: { ok: true },
+      next: migrateLegacy(LEGACY_SEED),
+    })).then((tx) => {
       set({ records: readLatest() });
+      if (tx.tx === "ok") return tx.result;
+      return { ok: false, message: tx.tx === "lock" ? MSG_LOCK : MSG_PERSIST };
     });
   },
 

@@ -1,5 +1,4 @@
-/* 并发“标签”worker：每个 localStorage key 对应一个独立文件，
-   与真实浏览器一致——不同 key 的写入互不覆盖；同一 key 通过临时文件+rename 原子替换。 */
+/* 并发“标签”worker：每个 localStorage key 一个独立文件，模拟真实多标签共享存储 */
 const { parentPort, workerData } = require("worker_threads");
 const fs = require("fs");
 
@@ -34,15 +33,37 @@ class FileStorage {
 globalThis.localStorage = new FileStorage();
 
 (async () => {
-  const { useInspectionStore } = await import("../src/store");
-  // 每个 worker 在随机微小时延后同时发起同一日期/班次/区域的生成
+  const { useInspectionStore, readLatest } = await import("../src/store");
+  const op = workerData.op;
   await new Promise((r) => setTimeout(r, workerData.delay));
-  const result = await useInspectionStore.getState().generate(
-    "2026-09-20", "morning", ["加油区", "油罐区", "收银区"]
-  );
-  parentPort.postMessage({
-    ok: result.ok,
-    created: result.ok ? result.created : 0,
-    duplicates: result.ok ? [] : result.duplicates,
-  });
+
+  let result;
+  if (op === "generate") {
+    result = await useInspectionStore.getState().generate(
+      workerData.date, "morning", ["加油区", "油罐区", "收银区"]
+    );
+  } else if (op === "remove") {
+    result = await useInspectionStore.getState().remove(workerData.recordId);
+  } else if (op === "status") {
+    result = await useInspectionStore.getState().changeStatus(
+      workerData.recordId,
+      workerData.target,
+      workerData.input
+    );
+  } else if (op === "reset") {
+    result = await useInspectionStore.getState().resetAll();
+  }
+  // 回传结果 + 该标签此刻读到的该记录快照，供主进程核对“无状态回退”
+  let snapshot = null;
+  if (workerData.recordId) {
+    const rec = readLatest().find((r) => r.id === workerData.recordId);
+    snapshot = rec
+      ? {
+          exists: true,
+          events: rec.statusEvents.length,
+          last: rec.statusEvents[rec.statusEvents.length - 1]?.status ?? null,
+        }
+      : { exists: false, events: 0, last: null };
+  }
+  parentPort.postMessage({ result, snapshot });
 })();

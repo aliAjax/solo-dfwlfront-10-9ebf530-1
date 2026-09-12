@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { DatePicker, Form, Input, Modal } from "antd";
+import { Alert, DatePicker, Form, Input, Modal } from "antd";
 import dayjs from "dayjs";
 import { InspectionStatus, STATUS_LABEL, StatusChangeInput } from "../domain";
 import { useInspectionStore } from "../store";
@@ -38,11 +38,14 @@ export default function StatusModal({
   const changeStatus = useInspectionStore((s) => s.changeStatus);
   const [form] = Form.useForm<FormValues>();
   const [saving, setSaving] = useState(false);
+  // 落盘/锁/记录缺失等可重试错误：顶部提示并保留弹窗；表单校验错误仍显示在字段下
+  const [submitError, setSubmitError] = useState("");
   const isAbnormal = target === "abnormal";
 
   useEffect(() => {
     if (open) {
       setSaving(false);
+      setSubmitError("");
       form.setFieldsValue({
         operator,
         reason: "",
@@ -81,11 +84,14 @@ export default function StatusModal({
           // 判定与写入均以 store 锁内重读的最新数据为准
           const result = await changeStatus(recordId, target, input);
           if (!result.ok) {
-            form.setFields([{ name: "reason", errors: [result.message] }]);
+            // 锁竞争 / 落盘失败 / 记录已被删除：保留弹窗与已填内容，明确失败并允许重试
+            setSubmitError(result.message);
             return;
           }
           onSucceeded();
           onClose();
+        } catch {
+          setSubmitError("提交失败，数据未改动，请重试。");
         } finally {
           setSaving(false);
         }
@@ -107,7 +113,21 @@ export default function StatusModal({
       confirmLoading={saving}
       okButtonProps={{ danger: isAbnormal }}
     >
-      <Form form={form} layout="vertical" className="status-form">
+      <Form
+        form={form}
+        layout="vertical"
+        className="status-form"
+        onValuesChange={() => setSubmitError("")}
+      >
+        {submitError && (
+          <Alert
+            type="error"
+            showIcon
+            message="本次未保存"
+            description={`${submitError} 已填写内容已保留，可直接重试。`}
+            style={{ marginBottom: 12 }}
+          />
+        )}
         <Form.Item
           label="操作人"
           name="operator"

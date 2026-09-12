@@ -90,15 +90,25 @@ export default function GeneratePanel() {
       );
       const scope = scopeOf(values);
       if (!outcome.ok) {
-        // 重复提示与拦截同源：只对本次触发条件生效
-        setDupAlert({ scope, items: outcome.duplicates });
-        message.warning(outcome.message);
+        if (outcome.duplicates.length > 0) {
+          // 重复拦截：提示只对本次触发条件生效，与拦截同源
+          setDupAlert({ scope, items: outcome.duplicates });
+          message.warning(outcome.message);
+        } else {
+          // 拿不到锁 / 存储失败：不显示成重复，明确失败，原数据未改动，可重试
+          setDupAlert(null);
+          message.error(outcome.message);
+        }
         return;
       }
       setDupAlert(null);
       message.success(
         `已生成 ${outcome.created} 项巡检（${scope.date} ${SHIFT_LABEL[scope.shift]}）。`
       );
+    } catch {
+      // 兜底：发生任何意外都不能假成功
+      setDupAlert(null);
+      message.error("生成失败，数据未改动，请重试。");
     } finally {
       setSubmitting(false);
     }
@@ -181,13 +191,9 @@ export default function GeneratePanel() {
             message={`${dupAlert.scope.date} ${
               SHIFT_LABEL[dupAlert.scope.shift]
             } 以下设备已存在，本次未写入任何记录：`}
-            description={
-              dupAlert.items.length > 0 ? (
-                dupAlert.items.map((d) => <div key={d}>· {d}</div>)
-              ) : (
-                <div>其他标签正在写入或所选范围无待生成项，请刷新后重试。</div>
-              )
-            }
+            description={dupAlert.items.map((d) => (
+              <div key={d}>· {d}</div>
+            ))}
           />
         )}
 
