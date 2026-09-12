@@ -1,289 +1,255 @@
-import { FormEvent, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
+import {
+  Button,
+  ConfigProvider,
+  DatePicker,
+  Input,
+  Popconfirm,
+  Progress,
+  Select,
+  Space,
+  Tag,
+  message,
+} from "antd";
+import zhCN from "antd/locale/zh_CN";
+import dayjs from "dayjs";
+import "dayjs/locale/zh-cn";
+import GeneratePanel from "./components/GeneratePanel";
+import RecordTable from "./components/RecordTable";
+import StatusModal from "./components/StatusModal";
+import {
+  ALL_AREA,
+  AREAS,
+  Filters,
+  InspectionRecord,
+  InspectionStatus,
+  STATUS_LABEL,
+  applyFilters,
+  computeStats,
+  currentStatus,
+} from "./domain";
+import { useInspectionStore } from "./store";
 
-type Field = {
-  key: string;
-  label: string;
-  type?: "number" | "date" | "select";
-  options?: string[];
+dayjs.locale("zh-cn");
+
+const STACK = ["React", "Vite", "TypeScript", "Zustand", "Ant Design"];
+
+type ModalState = {
+  open: boolean;
+  record: InspectionRecord | null;
+  target: InspectionStatus;
 };
 
-type RecordItem = {
-  id: string;
-  status: string;
-  notes: string;
-  createdAt: string;
-  [key: string]: string | number;
-};
-
-const project = {
-  "number": 10,
-  "folder": "dfwl/frontend/dfwlfront-10",
-  "framework": "react",
-  "title": "油站设备巡检清单",
-  "subtitle": "创建巡检项、标记异常，并统计今日巡检状态。",
-  "industry": "石油",
-  "stack": [
-    "React",
-    "Vite",
-    "TypeScript",
-    "Zustand",
-    "Ant Design"
-  ],
-  "storageKey": "dfwlfront-10-inspection",
-  "formTitle": "新增巡检项",
-  "primaryAction": "加入清单",
-  "entityLabel": "巡检项",
-  "statuses": [
-    "未检",
-    "正常",
-    "异常"
-  ],
-  "filters": [
-    "全部区域",
-    "加油区",
-    "油罐区",
-    "收银区"
-  ],
-  "fields": [
-    {
-      "key": "item",
-      "label": "巡检项"
-    },
-    {
-      "key": "area",
-      "label": "区域",
-      "type": "select",
-      "options": [
-        "加油区",
-        "油罐区",
-        "收银区"
-      ]
-    },
-    {
-      "key": "inspector",
-      "label": "巡检人"
-    },
-    {
-      "key": "checkedAt",
-      "label": "巡检日期",
-      "type": "date"
-    }
-  ],
-  "records": [
-    {
-      "item": "加油机1号",
-      "area": "加油区",
-      "inspector": "何鑫",
-      "checkedAt": "2026-06-30",
-      "status": "正常",
-      "notes": "无异常"
-    },
-    {
-      "item": "卸油口密封",
-      "area": "油罐区",
-      "inspector": "何鑫",
-      "checkedAt": "2026-06-30",
-      "status": "异常",
-      "notes": "密封圈老化"
-    }
-  ],
-  "metricLabels": [
-    "巡检项",
-    "异常",
-    "已检"
-  ]
-} as const;
-
-const fields = project.fields as unknown as Field[];
-const statuses: string[] = [...project.statuses];
-
-function createBlank() {
-  return Object.fromEntries(fields.map((field) => [field.key, field.type === "number" ? 0 : ""]));
-}
-
-function loadRecords(): RecordItem[] {
-  const raw = localStorage.getItem(project.storageKey);
-  if (!raw) {
-    return project.records.map((record, index) => ({
-      ...record,
-      id: `seed-${index + 1}`,
-      createdAt: new Date(Date.now() - index * 86400000).toISOString()
-    })) as RecordItem[];
-  }
-  try {
-    return JSON.parse(raw) as RecordItem[];
-  } catch {
-    return [];
-  }
-}
-
-function saveRecords(records: RecordItem[]) {
-  localStorage.setItem(project.storageKey, JSON.stringify(records));
-}
-
-function nextStatus(status: string) {
-  const index = statuses.indexOf(status);
-  return statuses[(index + 1) % statuses.length];
-}
-
-function primaryText(record: RecordItem) {
-  const first = fields[0];
-  const second = fields[1];
-  return [record[first.key], record[second.key]].filter(Boolean).join(" / ") || project.entityLabel;
-}
+const CLOSED_MODAL: ModalState = { open: false, record: null, target: "normal" };
 
 export default function App() {
-  const [records, setRecords] = useState<RecordItem[]>(loadRecords);
-  const [form, setForm] = useState<Record<string, string | number>>(createBlank);
-  const [note, setNote] = useState("");
-  const [filter, setFilter] = useState<string>(project.filters[0]);
+  const records = useInspectionStore((s) => s.records);
+  const operator = useInspectionStore((s) => s.operator);
+  const setOperator = useInspectionStore((s) => s.setOperator);
+  const remove = useInspectionStore((s) => s.remove);
+  const resetAll = useInspectionStore((s) => s.resetAll);
 
-  const filteredRecords = useMemo(() => {
-    if (filter.startsWith("全部")) return records;
-    return records.filter((record) => Object.values(record).includes(filter));
-  }, [filter, records]);
+  const [operatorDraft, setOperatorDraft] = useState(operator);
+  const [filters, setFilters] = useState<Filters>({
+    area: ALL_AREA,
+    status: "all",
+    date: "",
+    keyword: "",
+  });
+  const [modal, setModal] = useState<ModalState>(CLOSED_MODAL);
 
-  const metrics = useMemo(() => {
-    const total = records.length;
-    const second = records.filter((record) => record.status === statuses[1]).length;
-    const third = records.filter((record) => record.status === statuses[2]).length;
-    const numberValues = records.flatMap((record) =>
-      fields.filter((field) => field.type === "number").map((field) => Number(record[field.key] || 0))
-    );
-    const sum = numberValues.reduce((acc, value) => acc + value, 0);
-    return [total, second || sum, third || Math.round(sum / Math.max(total, 1))];
-  }, [records]);
+  const filtered = useMemo(() => applyFilters(records, filters), [records, filters]);
+  const stats = useMemo(() => computeStats(filtered), [filtered]);
+  const maxStatusCount = Math.max(1, stats.pending, stats.normal, stats.abnormal);
 
-  const chartRows = statuses.map((status) => ({
-    status,
-    value: records.filter((record) => record.status === status).length
-  }));
-  const maxChart = Math.max(1, ...chartRows.map((row) => row.value));
+  const statusOptions: Array<{ value: Filters["status"]; label: string }> = [
+    { value: "all", label: "全部状态" },
+    { value: "pending", label: STATUS_LABEL.pending },
+    { value: "normal", label: STATUS_LABEL.normal },
+    { value: "abnormal", label: STATUS_LABEL.abnormal },
+  ];
 
-  function updateRecords(next: RecordItem[]) {
-    setRecords(next);
-    saveRecords(next);
+  function patchFilter(patch: Partial<Filters>) {
+    setFilters((prev) => ({ ...prev, ...patch }));
   }
 
-  function handleSubmit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    const next: RecordItem = {
-      ...form,
-      id: crypto.randomUUID(),
-      status: statuses[0],
-      notes: note || "暂无备注",
-      createdAt: new Date().toISOString()
-    } as RecordItem;
-    updateRecords([next, ...records]);
-    setForm(createBlank());
-    setNote("");
+  function resetFilters() {
+    setFilters({ area: ALL_AREA, status: "all", date: "", keyword: "" });
   }
+
+  function openModal(record: InspectionRecord, target: InspectionStatus) {
+    setModal({ open: true, record, target });
+  }
+
+  function handleRemove(id: string) {
+    remove(id);
+    message.success("记录已删除");
+  }
+
+  const metricCards = [
+    { key: "total", label: "巡检项（当前筛选）", value: stats.total, tone: "" },
+    { key: "pending", label: "未检", value: stats.pending, tone: "tone-pending" },
+    { key: "normal", label: "正常", value: stats.normal, tone: "tone-normal" },
+    { key: "abnormal", label: "异常", value: stats.abnormal, tone: "tone-abnormal" },
+  ];
 
   return (
-    <main className="app">
-      <div className="shell">
-        <header className="topbar">
-          <div>
-            <p className="eyebrow">{project.industry}行业前端最小闭环</p>
-            <h1>{project.title}</h1>
-            <p className="subtitle">{project.subtitle}</p>
-          </div>
-          <div className="stack">{project.stack.map((item) => <span className="tag" key={item}>{item}</span>)}</div>
-        </header>
+    <ConfigProvider locale={zhCN}>
+      <main className="app">
+        <div className="shell">
+          <header className="topbar">
+            <div>
+              <p className="eyebrow">石油行业 · 当班巡检闭环</p>
+              <h1>油站设备巡检清单</h1>
+              <p className="subtitle">
+                按区域一次生成当班巡检项，未检 / 正常 / 异常三态由巡检记录驱动；状态变更全程留痕，
+                异常整改闭环后方可关闭。
+              </p>
+            </div>
+            <div className="topbar-side">
+              <div className="stack">
+                {STACK.map((item) => (
+                  <span className="tag" key={item}>
+                    {item}
+                  </span>
+                ))}
+              </div>
+              <Space className="operator-bar">
+              <Space.Compact className="operator-bar-input">
+                <Button disabled>当班员工</Button>
+                <Input
+                  placeholder="输入姓名后自动保存"
+                  value={operatorDraft}
+                  maxLength={20}
+                  onChange={(e) => setOperatorDraft(e.target.value)}
+                  onBlur={() => setOperator(operatorDraft)}
+                  onPressEnter={() => setOperator(operatorDraft)}
+                  style={{ width: 180 }}
+                />
+              </Space.Compact>
+                <Popconfirm
+                  title="恢复为演示数据？"
+                  description="当前所有巡检记录将被清空并重新写入旧格式示例数据。"
+                  okText="恢复"
+                  cancelText="取消"
+                  onConfirm={() => {
+                    resetAll();
+                    message.success("已恢复演示数据（旧格式）");
+                  }}
+                >
+                  <Button>重置演示数据</Button>
+                </Popconfirm>
+              </Space>
+            </div>
+          </header>
 
-        <section className="metrics">
-          {project.metricLabels.map((label, index) => (
-            <article className="metric" key={label}>
-              <span>{label}</span>
-              <strong>{metrics[index]}</strong>
+          <section className="metrics">
+            {metricCards.map((card) => (
+              <article className={`metric ${card.tone}`} key={card.key}>
+                <span>{card.label}</span>
+                <strong>{card.value}</strong>
+              </article>
+            ))}
+            <article className="metric metric-progress">
+              <span>
+                当班完成率（已检 {stats.checked}/{stats.total}）
+              </span>
+              <Progress percent={stats.completion} status={stats.abnormal > 0 ? "exception" : "active"} />
+              <div className="dist-bars">
+                {(
+                  [
+                    ["pending", stats.pending, "#8c8c8c"],
+                    ["normal", stats.normal, "#52c41a"],
+                    ["abnormal", stats.abnormal, "#ff4d4f"],
+                  ] as const
+                ).map(([key, value, color]) => (
+                  <div className="dist-row" key={key}>
+                    <span>{STATUS_LABEL[key]}</span>
+                    <div className="dist-track">
+                      <div
+                        className="dist-fill"
+                        style={{ width: `${(value / maxStatusCount) * 100}%`, background: color }}
+                      />
+                    </div>
+                    <strong>{value}</strong>
+                  </div>
+                ))}
+              </div>
             </article>
-          ))}
-        </section>
-
-        <section className="workspace">
-          <form className="panel" onSubmit={handleSubmit}>
-            <h2>{project.formTitle}</h2>
-            <div className="form-grid">
-              {fields.map((field) => (
-                <label key={field.key}>
-                  {field.label}
-                  {field.type === "select" ? (
-                    <select
-                      value={String(form[field.key])}
-                      onChange={(event) => setForm({ ...form, [field.key]: event.target.value })}
-                      required
-                    >
-                      <option value="">请选择</option>
-                      {field.options?.map((option) => <option key={option}>{option}</option>)}
-                    </select>
-                  ) : (
-                    <input
-                      type={field.type || "text"}
-                      value={form[field.key]}
-                      onChange={(event) =>
-                        setForm({ ...form, [field.key]: field.type === "number" ? Number(event.target.value) : event.target.value })
-                      }
-                      required
-                    />
-                  )}
-                </label>
-              ))}
-              <label>
-                备注
-                <textarea value={note} onChange={(event) => setNote(event.target.value)} placeholder="填写处理说明或现场备注" />
-              </label>
-              <button type="submit">{project.primaryAction}</button>
-            </div>
-          </form>
-
-          <section className="list-panel">
-            <div className="toolbar">
-              <h2>{project.entityLabel}列表</h2>
-              <select value={filter} onChange={(event) => setFilter(event.target.value)}>
-                {project.filters.map((item) => <option key={item}>{item}</option>)}
-              </select>
-            </div>
-
-            <div className="record-grid">
-              {filteredRecords.length === 0 ? <div className="empty">暂无匹配数据</div> : filteredRecords.map((record) => (
-                <article className="record" key={record.id}>
-                  <div className="record-head">
-                    <p className="record-title">{primaryText(record)}</p>
-                    <span className="status">{record.status}</span>
-                  </div>
-                  <div className="details">
-                    {fields.map((field) => (
-                      <span key={field.key}>{field.label}: {record[field.key]}</span>
-                    ))}
-                  </div>
-                  <p className="note">{record.notes}</p>
-                  <div className="actions">
-                    <button type="button" onClick={() => updateRecords(records.map((item) => item.id === record.id ? { ...item, status: nextStatus(item.status) } : item))}>
-                      流转状态
-                    </button>
-                    <button className="secondary" type="button" onClick={() => navigator.clipboard?.writeText(primaryText(record))}>
-                      复制摘要
-                    </button>
-                    <button className="danger" type="button" onClick={() => updateRecords(records.filter((item) => item.id !== record.id))}>
-                      删除
-                    </button>
-                  </div>
-                </article>
-              ))}
-            </div>
-
-            <div className="mini-chart">
-              {chartRows.map((row) => (
-                <div className="bar" key={row.status}>
-                  <span>{row.status}</span>
-                  <div className="bar-track"><div className="bar-fill" style={{ width: `${(row.value / maxChart) * 100}%` }} /></div>
-                  <strong>{row.value}</strong>
-                </div>
-              ))}
-            </div>
           </section>
-        </section>
-      </div>
-    </main>
+
+          <section className="workspace">
+            <div className="left-col">
+              <GeneratePanel />
+            </div>
+
+            <section className="list-panel">
+              <div className="toolbar">
+                <h2>
+                  巡检记录 <Tag>{filtered.length} 条</Tag>
+                </h2>
+                <Space size={8} wrap className="filters">
+                  <Select
+                    value={filters.area}
+                    onChange={(value) => patchFilter({ area: value })}
+                    style={{ width: 120 }}
+                    options={[ALL_AREA, ...AREAS].map((a) => ({ value: a, label: a }))}
+                  />
+                  <Select
+                    value={filters.status}
+                    onChange={(value) => patchFilter({ status: value })}
+                    style={{ width: 120 }}
+                    options={statusOptions}
+                  />
+                  <DatePicker
+                    value={filters.date ? dayjs(filters.date) : null}
+                    onChange={(d) => patchFilter({ date: d ? d.format("YYYY-MM-DD") : "" })}
+                    placeholder="巡检日期（可清空）"
+                    allowClear
+                    style={{ width: 190 }}
+                  />
+                  <Input.Search
+                    allowClear
+                    placeholder="关键字：设备 / 操作人 / 原因 / 整改"
+                    value={filters.keyword}
+                    onChange={(e) => patchFilter({ keyword: e.target.value })}
+                    style={{ width: 260 }}
+                  />
+                  <Button onClick={resetFilters}>重置筛选</Button>
+                </Space>
+              </div>
+
+              <RecordTable
+                rows={filtered}
+                onChange={openModal}
+                onRemove={handleRemove}
+              />
+            </section>
+          </section>
+        </div>
+
+        {modal.open && modal.record && (
+          <StatusModal
+            open={modal.open}
+            recordId={modal.record.id}
+            device={modal.record.device}
+            current={currentStatus(modal.record)}
+            target={modal.target}
+            operator={operator || operatorDraft}
+            onClose={() => setModal(CLOSED_MODAL)}
+            onSucceeded={() => {
+              const wasAbnormal = currentStatus(modal.record!) === "abnormal";
+              message.success(
+                modal.target === "abnormal"
+                  ? "异常已登记"
+                  : wasAbnormal
+                    ? "异常已整改关闭"
+                    : "巡检结果已登记"
+              );
+            }}
+          />
+        )}
+      </main>
+    </ConfigProvider>
   );
 }
